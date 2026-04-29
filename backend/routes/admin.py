@@ -1,8 +1,9 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash
-from models import User, TimetableEntry, Subject, Room, Notification
-from extensions import db
+from bson import ObjectId
+from database import users_col, timetable_col, subjects_col, rooms_col, notifications_col
+from datetime import datetime
 from functools import wraps
 
 admin_bp = Blueprint("admin", __name__)
@@ -11,202 +12,181 @@ admin_bp = Blueprint("admin", __name__)
 def require_admin(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        user_id = get_jwt_identity()
-        user = User.query.get(int(user_id))
-        if not user or user.role != "admin":
+        uid = get_jwt_identity()
+        user = users_col().find_one({"_id": ObjectId(uid)})
+        if not user or user["role"] != "admin":
             return jsonify({"error": "Admin access required"}), 403
         return f(*args, **kwargs)
     return decorated
 
 
-# ── Dashboard Stats ────────────────────────────────────────────────────────────
+def entry_to_dict(e):
+    return {
+        "id": str(e["_id"]),
+        "subject_code": e.get("subject_code"),
+        "subject_name": e.get("subject_name"),
+        "faculty_id": e.get("faculty_id"),
+        "faculty_name": e.get("faculty_name"),
+        "faculty_website": e.get("faculty_website", ""),
+        "room_id": e.get("room_id"),
+        "room_name": e.get("room_name"),
+        "day": e.get("day"),
+        "start_time": e.get("start_time"),
+        "end_time": e.get("end_time"),
+        "stream": e.get("stream"),
+        "section": e.get("section"),
+        "semester": e.get("semester"),
+        "type": e.get("type"),
+    }
+
+
+# ── Stats ─────────────────────────────────────────────────────────────────────
 
 @admin_bp.route("/stats", methods=["GET"])
 @jwt_required()
 @require_admin
 def get_stats():
-    total_users = User.query.count()
-    total_faculty = User.query.filter_by(role="faculty").count()
-    total_students = User.query.filter_by(role="student").count()
-    total_entries = TimetableEntry.query.count()
-    total_subjects = Subject.query.count()
-    total_rooms = Room.query.count()
+    col_t = timetable_col()
 
-    # Entries per programme
-    programmes = db.session.query(
-        TimetableEntry.stream,
-        db.func.count(TimetableEntry.id)
-    ).group_by(TimetableEntry.stream).all()
-
+    # Entries per stream
+    pipeline_stream = [{"$group": {"_id": "$stream", "count": {"$sum": 1}}}]
     # Entries per day
-    per_day = db.session.query(
-        TimetableEntry.day,
-        db.func.count(TimetableEntry.id)
-    ).group_by(TimetableEntry.day).all()
-
-    # Faculty workload (entries per faculty)
-    workload = db.session.query(
-        TimetableEntry.faculty_name,
-        db.func.count(TimetableEntry.id)
-    ).group_by(TimetableEntry.faculty_name).order_by(
-        db.func.count(TimetableEntry.id).desc()
-    ).limit(10).all()
+    pipeline_day = [{"$group": {"_id": "$day", "count": {"$sum": 1}}}]
+    # Faculty workload
+    pipeline_wl = [
+        {"$group": {"_id": "$faculty_name", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}}, {"$limit": 10}
+    ]
 
     return jsonify({
-        "total_users": total_users,
-        "total_faculty": total_faculty,
-        "total_students": total_students,
-        "total_entries": total_entries,
-        "total_subjects": total_subjects,
-        "total_rooms": total_rooms,
-        "entries_per_programme": [{"stream": s, "count": c} for s, c in programmes],
-        "entries_per_day": [{"day": d, "count": c} for d, c in per_day],
-        "faculty_workload": [{"faculty": f, "count": c} for f, c in workload],
+        "total_users": users_col().count_documents({}),
+        "total_faculty": users_col().count_documents({"role": "faculty"}),
+        "total_students": users_col().count_documents({"role": "student"}),
+        "total_entries": col_t.count_documents({}),
+        "total_subjects": subjects_col().count_documents({}),
+        "total_rooms": rooms_col().count_documents({}),
+        "entries_per_programme": [{"stream": r["_id"], "count": r["count"]}
+                                   for r in col_t.aggregate(pipeline_stream)],
+        "entries_per_day": [{"day": r["_id"], "count": r["count"]}
+                             for r in col_t.aggregate(pipeline_day)],
+        "faculty_workload": [{"faculty": r["_id"], "count": r["count"]}
+                              for r in col_t.aggregate(pipeline_wl)],
     }), 200
 
 
-# ── User Management ────────────────────────────────────────────────────────────
+# ── User Management ───────────────────────────────────────────────────────────
 
 @admin_bp.route("/users", methods=["GET"])
 @jwt_required()
 @require_admin
 def get_users():
-    role = request.args.get("role")
-    query = User.query
-    if role:
-        query = query.filter_by(role=role)
-    users = query.order_by(User.created_at.desc()).all()
-    return jsonify({"users": [u.to_dict() for u in users]}), 200
+    from routes.auth import user_to_dict
+    q = {}
+    if request.args.get("role"):
+        q["role"] = request.args["role"]
+    users = list(users_col().find(q).sort("created_at", -1))
+    return jsonify({"users": [user_to_dict(u) for u in users]}), 200
 
 
-@admin_bp.route("/users/<int:user_id>", methods=["GET"])
+@admin_bp.route("/users/<user_id>", methods=["GET"])
 @jwt_required()
 @require_admin
 def get_user(user_id):
-    user = User.query.get(user_id)
+    from routes.auth import user_to_dict
+    user = users_col().find_one({"_id": ObjectId(user_id)})
     if not user:
         return jsonify({"error": "User not found"}), 404
-    return jsonify({"user": user.to_dict()}), 200
+    return jsonify({"user": user_to_dict(user)}), 200
 
 
-@admin_bp.route("/users/<int:user_id>", methods=["PUT"])
+@admin_bp.route("/users/<user_id>", methods=["PUT"])
 @jwt_required()
 @require_admin
 def update_user(user_id):
-    user = User.query.get(user_id)
+    from routes.auth import user_to_dict
+    user = users_col().find_one({"_id": ObjectId(user_id)})
     if not user:
         return jsonify({"error": "User not found"}), 404
 
     data = request.get_json()
-    if "name" in data:
-        user.name = data["name"].strip()
-    if "role" in data and data["role"] in ("student", "faculty"):
-        user.role = data["role"]
-    if "stream" in data:
-        user.stream = data["stream"]
-    if "section" in data:
-        user.section = data["section"]
-    if "semester" in data:
-        user.semester = data["semester"]
-    if "department" in data:
-        user.department = data["department"]
-    if "is_approved" in data:
-        user.is_approved = bool(data["is_approved"])
-    if "website_url" in data:
-        user.website_url = data["website_url"]
+    updates = {}
+    for field in ["name", "role", "stream", "section", "semester", "department",
+                  "is_approved", "website_url"]:
+        if field in data:
+            updates[field] = data[field]
 
-    db.session.commit()
+    if updates:
+        users_col().update_one({"_id": ObjectId(user_id)}, {"$set": updates})
+        if user["role"] == "faculty" and ("name" in updates or "website_url" in updates):
+            sync = {}
+            if "name" in updates: sync["faculty_name"] = updates["name"]
+            if "website_url" in updates: sync["faculty_website"] = updates["website_url"]
+            timetable_col().update_many({"faculty_id": user_id}, {"$set": sync})
 
-    # Sync faculty name/website to timetable entries
-    if user.role == "faculty":
-        TimetableEntry.query.filter_by(faculty_id=user.id).update({
-            "faculty_name": user.name,
-            "faculty_website": user.website_url or ""
-        })
-        db.session.commit()
-
-    return jsonify({"message": "User updated", "user": user.to_dict()}), 200
+    updated = users_col().find_one({"_id": ObjectId(user_id)})
+    return jsonify({"message": "User updated", "user": user_to_dict(updated)}), 200
 
 
-@admin_bp.route("/users/<int:user_id>/approve", methods=["PUT"])
+@admin_bp.route("/users/<user_id>/approve", methods=["PUT"])
 @jwt_required()
 @require_admin
 def toggle_approval(user_id):
-    user = User.query.get(user_id)
+    user = users_col().find_one({"_id": ObjectId(user_id)})
     if not user:
         return jsonify({"error": "User not found"}), 404
-    if user.role == "admin":
+    if user["role"] == "admin":
         return jsonify({"error": "Cannot modify admin accounts"}), 400
+    new_status = not user.get("is_approved", True)
+    users_col().update_one({"_id": ObjectId(user_id)}, {"$set": {"is_approved": new_status}})
+    return jsonify({"message": "approved" if new_status else "suspended",
+                    "is_approved": new_status}), 200
 
-    user.is_approved = not user.is_approved
-    db.session.commit()
-    status = "approved" if user.is_approved else "suspended"
-    return jsonify({"message": f"User {status}", "is_approved": user.is_approved}), 200
 
-
-@admin_bp.route("/users/<int:user_id>/reset-password", methods=["PUT"])
+@admin_bp.route("/users/<user_id>/reset-password", methods=["PUT"])
 @jwt_required()
 @require_admin
 def reset_password(user_id):
-    user = User.query.get(user_id)
+    user = users_col().find_one({"_id": ObjectId(user_id)})
     if not user:
         return jsonify({"error": "User not found"}), 404
-
     data = request.get_json()
-    new_password = data.get("new_password", "")
-    if len(new_password) < 6:
+    new_pw = data.get("new_password", "")
+    if len(new_pw) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
-
-    user.password = generate_password_hash(new_password)
-    db.session.commit()
+    users_col().update_one({"_id": ObjectId(user_id)},
+                           {"$set": {"password": generate_password_hash(new_pw)}})
     return jsonify({"message": "Password reset successfully"}), 200
 
 
-@admin_bp.route("/users/<int:user_id>", methods=["DELETE"])
+@admin_bp.route("/users/<user_id>", methods=["DELETE"])
 @jwt_required()
 @require_admin
 def delete_user(user_id):
-    user = User.query.get(user_id)
+    user = users_col().find_one({"_id": ObjectId(user_id)})
     if not user:
         return jsonify({"error": "User not found"}), 404
-    if user.role == "admin":
+    if user["role"] == "admin":
         return jsonify({"error": "Cannot delete admin accounts"}), 400
-
-    # Remove timetable entries if faculty
-    if user.role == "faculty":
-        TimetableEntry.query.filter_by(faculty_id=user.id).delete()
-
-    # Remove notifications
-    Notification.query.filter_by(user_id=user.id).delete()
-
-    db.session.delete(user)
-    db.session.commit()
+    if user["role"] == "faculty":
+        timetable_col().delete_many({"faculty_id": user_id})
+    notifications_col().delete_many({"user_id": user_id})
+    users_col().delete_one({"_id": ObjectId(user_id)})
     return jsonify({"message": "User deleted"}), 200
 
 
-# ── Timetable Management (Admin can manage all entries) ───────────────────────
+# ── Timetable Management ──────────────────────────────────────────────────────
 
 @admin_bp.route("/timetable", methods=["GET"])
 @jwt_required()
 @require_admin
 def get_all_timetable():
-    stream = request.args.get("stream")
-    section = request.args.get("section")
-    day = request.args.get("day")
-    faculty_id = request.args.get("faculty_id")
-
-    query = TimetableEntry.query
-    if stream:
-        query = query.filter_by(stream=stream)
-    if section:
-        query = query.filter_by(section=section)
-    if day:
-        query = query.filter_by(day=day)
-    if faculty_id:
-        query = query.filter_by(faculty_id=int(faculty_id))
-
-    entries = query.order_by(TimetableEntry.stream, TimetableEntry.day, TimetableEntry.start_time).all()
-    return jsonify({"entries": [e.to_dict() for e in entries]}), 200
+    q = {}
+    if request.args.get("stream"):    q["stream"] = request.args["stream"]
+    if request.args.get("day"):       q["day"] = request.args["day"]
+    if request.args.get("faculty_id"): q["faculty_id"] = request.args["faculty_id"]
+    entries = list(timetable_col().find(q).sort(
+        [("stream", 1), ("day", 1), ("start_time", 1)]))
+    return jsonify({"entries": [entry_to_dict(e) for e in entries]}), 200
 
 
 @admin_bp.route("/timetable", methods=["POST"])
@@ -215,82 +195,71 @@ def get_all_timetable():
 def admin_create_entry():
     data = request.get_json()
     required = ["subject_code", "subject_name", "faculty_id", "room_id",
-                "day", "start_time", "end_time", "stream", "section", "semester", "type"]
+                "day", "start_time", "end_time", "stream", "type"]
     if not all(data.get(f) for f in required):
         return jsonify({"error": "Missing required fields"}), 400
 
-    faculty = User.query.get(int(data["faculty_id"]))
+    faculty = users_col().find_one({"_id": ObjectId(data["faculty_id"])})
     if not faculty:
         return jsonify({"error": "Faculty not found"}), 404
-
-    room = Room.query.get(int(data["room_id"]))
+    room = rooms_col().find_one({"_id": ObjectId(data["room_id"])})
     if not room:
         return jsonify({"error": "Room not found"}), 404
 
-    # Conflict check
-    conflict = TimetableEntry.query.filter_by(
-        room_id=data["room_id"], day=data["day"]
-    ).filter(
-        TimetableEntry.start_time < data["end_time"],
-        TimetableEntry.end_time > data["start_time"]
-    ).first()
+    conflict = timetable_col().find_one({
+        "room_id": data["room_id"], "day": data["day"],
+        "start_time": {"$lt": data["end_time"]},
+        "end_time": {"$gt": data["start_time"]}
+    })
     if conflict:
-        return jsonify({"error": f"Room conflict: {room.name} already booked {conflict.start_time}-{conflict.end_time} on {data['day']}"}), 409
+        return jsonify({"error": f"Room conflict: {room['name']} already booked "
+                                  f"{conflict['start_time']}-{conflict['end_time']} on {data['day']}"}), 409
 
-    entry = TimetableEntry(
-        subject_code=data["subject_code"],
-        subject_name=data["subject_name"],
-        faculty_id=faculty.id,
-        faculty_name=faculty.name,
-        faculty_website=faculty.website_url or "",
-        room_id=room.id,
-        room_name=room.name,
-        day=data["day"],
-        start_time=data["start_time"],
-        end_time=data["end_time"],
-        stream=data["stream"],
-        section=data["section"],
-        semester=int(data["semester"]),
-        type=data["type"],
-    )
-    db.session.add(entry)
-    db.session.commit()
-    return jsonify({"message": "Entry created", "entry": entry.to_dict()}), 201
+    now = datetime.utcnow()
+    doc = {
+        "subject_code": data["subject_code"],
+        "subject_name": data["subject_name"],
+        "faculty_id": data["faculty_id"],
+        "faculty_name": faculty["name"],
+        "faculty_website": faculty.get("website_url", ""),
+        "room_id": data["room_id"],
+        "room_name": room["name"],
+        "day": data["day"],
+        "start_time": data["start_time"],
+        "end_time": data["end_time"],
+        "stream": data["stream"],
+        "section": data.get("section"),
+        "semester": data.get("semester"),
+        "type": data["type"],
+        "created_at": now, "updated_at": now,
+    }
+    result = timetable_col().insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return jsonify({"message": "Entry created", "entry": entry_to_dict(doc)}), 201
 
 
-@admin_bp.route("/timetable/<int:entry_id>", methods=["DELETE"])
+@admin_bp.route("/timetable/<entry_id>", methods=["DELETE"])
 @jwt_required()
 @require_admin
 def admin_delete_entry(entry_id):
-    entry = TimetableEntry.query.get(entry_id)
-    if not entry:
+    result = timetable_col().delete_one({"_id": ObjectId(entry_id)})
+    if result.deleted_count == 0:
         return jsonify({"error": "Entry not found"}), 404
-    db.session.delete(entry)
-    db.session.commit()
     return jsonify({"message": "Entry deleted"}), 200
 
 
-# ── Reports ────────────────────────────────────────────────────────────────────
+# ── Reports ───────────────────────────────────────────────────────────────────
 
 @admin_bp.route("/reports/schedule", methods=["GET"])
 @jwt_required()
 @require_admin
 def schedule_report():
-    """Full schedule grouped by programme and day."""
-    entries = TimetableEntry.query.order_by(
-        TimetableEntry.stream, TimetableEntry.section,
-        TimetableEntry.day, TimetableEntry.start_time
-    ).all()
-
+    entries = list(timetable_col().find().sort(
+        [("stream", 1), ("day", 1), ("start_time", 1)]))
     report = {}
     for e in entries:
-        key = f"{e.stream} - {e.section}"
-        if key not in report:
-            report[key] = {}
-        if e.day not in report[key]:
-            report[key][e.day] = []
-        report[key][e.day].append(e.to_dict())
-
+        key = e["stream"]
+        report.setdefault(key, {}).setdefault(e["day"], []).append(entry_to_dict(e))
     return jsonify({"report": report}), 200
 
 
@@ -298,23 +267,22 @@ def schedule_report():
 @jwt_required()
 @require_admin
 def faculty_load_report():
-    """Hours per faculty per week."""
-    faculty_list = User.query.filter_by(role="faculty").all()
+    faculty_list = list(users_col().find({"role": "faculty"}))
     report = []
     for f in faculty_list:
-        entries = TimetableEntry.query.filter_by(faculty_id=f.id).all()
+        fid = str(f["_id"])
+        entries = list(timetable_col().find({"faculty_id": fid}))
         total_hours = sum(
-            (int(e.end_time.split(":")[0]) - int(e.start_time.split(":")[0]))
+            int(e["end_time"].split(":")[0]) - int(e["start_time"].split(":")[0])
             for e in entries
         )
         report.append({
-            "faculty_id": f.id,
-            "name": f.name,
-            "email": f.email,
-            "stream": f.stream,
+            "faculty_id": fid,
+            "name": f["name"],
+            "email": f["email"],
+            "department": f.get("department", ""),
             "total_classes": len(entries),
             "total_hours_per_week": total_hours,
-            "website_url": f.website_url or "",
         })
     report.sort(key=lambda x: x["total_hours_per_week"], reverse=True)
     return jsonify({"report": report}), 200
@@ -324,50 +292,41 @@ def faculty_load_report():
 @jwt_required()
 @require_admin
 def room_utilization_report():
-    """Usage count per room."""
-    rooms = Room.query.all()
+    rooms = list(rooms_col().find())
     report = []
     for r in rooms:
-        count = TimetableEntry.query.filter_by(room_id=r.id).count()
-        report.append({
-            "room_id": r.id,
-            "name": r.name,
-            "capacity": r.capacity,
-            "total_bookings": count,
-        })
+        rid = str(r["_id"])
+        count = timetable_col().count_documents({"room_id": rid})
+        report.append({"room_id": rid, "name": r["name"],
+                        "capacity": r.get("capacity"), "total_bookings": count})
     report.sort(key=lambda x: x["total_bookings"], reverse=True)
     return jsonify({"report": report}), 200
 
 
-# ── Subject & Room Management ──────────────────────────────────────────────────
+# ── Subject & Room Management ─────────────────────────────────────────────────
 
 @admin_bp.route("/subjects", methods=["POST"])
 @jwt_required()
 @require_admin
 def create_subject():
     data = request.get_json()
-    from models import Subject
-    if Subject.query.filter_by(code=data.get("code")).first():
-        return jsonify({"error": "Subject code already exists"}), 400
-    subj = Subject(
-        name=data["name"], code=data["code"],
-        stream=data.get("stream"), type=data.get("type", "core")
-    )
-    db.session.add(subj)
-    db.session.commit()
-    return jsonify({"message": "Subject created", "subject": subj.to_dict()}), 201
+    if subjects_col().find_one({"code": data.get("code"), "stream": data.get("stream")}):
+        return jsonify({"error": "Subject already exists for this stream"}), 400
+    result = subjects_col().insert_one({
+        "name": data["name"], "code": data["code"],
+        "stream": data.get("stream"), "type": data.get("type", "core")
+    })
+    return jsonify({"message": "Subject created",
+                    "subject": {"id": str(result.inserted_id), **data}}), 201
 
 
-@admin_bp.route("/subjects/<int:subj_id>", methods=["DELETE"])
+@admin_bp.route("/subjects/<subj_id>", methods=["DELETE"])
 @jwt_required()
 @require_admin
 def delete_subject(subj_id):
-    from models import Subject
-    subj = Subject.query.get(subj_id)
-    if not subj:
+    result = subjects_col().delete_one({"_id": ObjectId(subj_id)})
+    if result.deleted_count == 0:
         return jsonify({"error": "Subject not found"}), 404
-    db.session.delete(subj)
-    db.session.commit()
     return jsonify({"message": "Subject deleted"}), 200
 
 
@@ -376,19 +335,17 @@ def delete_subject(subj_id):
 @require_admin
 def create_room():
     data = request.get_json()
-    room = Room(name=data["name"], capacity=data.get("capacity", 60))
-    db.session.add(room)
-    db.session.commit()
-    return jsonify({"message": "Room created", "room": room.to_dict()}), 201
+    result = rooms_col().insert_one({"name": data["name"], "capacity": data.get("capacity", 60)})
+    return jsonify({"message": "Room created",
+                    "room": {"id": str(result.inserted_id), "name": data["name"],
+                             "capacity": data.get("capacity", 60)}}), 201
 
 
-@admin_bp.route("/rooms/<int:room_id>", methods=["DELETE"])
+@admin_bp.route("/rooms/<room_id>", methods=["DELETE"])
 @jwt_required()
 @require_admin
 def delete_room(room_id):
-    room = Room.query.get(room_id)
-    if not room:
+    result = rooms_col().delete_one({"_id": ObjectId(room_id)})
+    if result.deleted_count == 0:
         return jsonify({"error": "Room not found"}), 404
-    db.session.delete(room)
-    db.session.commit()
     return jsonify({"message": "Room deleted"}), 200

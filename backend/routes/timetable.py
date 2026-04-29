@@ -1,129 +1,129 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from models import TimetableEntry, User, Subject, Room, Notification
-from extensions import db
+from bson import ObjectId
+from database import timetable_col, subjects_col, rooms_col, notifications_col, users_col
 
 timetable_bp = Blueprint("timetable", __name__)
+
+
+def entry_to_dict(e):
+    return {
+        "id": str(e["_id"]),
+        "subject_code": e.get("subject_code"),
+        "subject_name": e.get("subject_name"),
+        "faculty_id": e.get("faculty_id"),
+        "faculty_name": e.get("faculty_name"),
+        "faculty_website": e.get("faculty_website", ""),
+        "room_id": e.get("room_id"),
+        "room_name": e.get("room_name"),
+        "day": e.get("day"),
+        "start_time": e.get("start_time"),
+        "end_time": e.get("end_time"),
+        "stream": e.get("stream"),
+        "section": e.get("section"),
+        "semester": e.get("semester"),
+        "type": e.get("type"),
+    }
+
 
 @timetable_bp.route("/", methods=["GET"])
 @jwt_required()
 def get_timetable():
-    stream = request.args.get("stream")
-    section = request.args.get("section")
-    semester = request.args.get("semester")
-    day = request.args.get("day")
-    subject_code = request.args.get("subject_code")
-    faculty_id = request.args.get("faculty_id")
-    room_name = request.args.get("room_name")
-    entry_type = request.args.get("type")
+    q = {}
+    if request.args.get("stream"):   q["stream"] = request.args["stream"]
+    if request.args.get("semester"): q["semester"] = int(request.args["semester"])
+    if request.args.get("day"):      q["day"] = request.args["day"]
+    if request.args.get("subject_code"): q["subject_code"] = request.args["subject_code"]
+    if request.args.get("faculty_id"):   q["faculty_id"] = request.args["faculty_id"]
+    if request.args.get("room_name"):    q["room_name"] = request.args["room_name"]
+    if request.args.get("type"):         q["type"] = request.args["type"]
 
-    query = TimetableEntry.query
-    if stream:
-        query = query.filter_by(stream=stream)
-    if section:
-        query = query.filter_by(section=section)
-    if semester:
-        query = query.filter_by(semester=int(semester))
-    if day:
-        query = query.filter_by(day=day)
-    if subject_code:
-        query = query.filter_by(subject_code=subject_code)
-    if faculty_id:
-        query = query.filter_by(faculty_id=int(faculty_id))
-    if room_name:
-        query = query.filter_by(room_name=room_name)
-    if entry_type:
-        query = query.filter_by(type=entry_type)
-
-    entries = query.order_by(TimetableEntry.day, TimetableEntry.start_time).all()
-    return jsonify({"entries": [e.to_dict() for e in entries]}), 200
+    entries = list(timetable_col().find(q).sort([("day", 1), ("start_time", 1)]))
+    return jsonify({"entries": [entry_to_dict(e) for e in entries]}), 200
 
 
 @timetable_bp.route("/student", methods=["GET"])
 @jwt_required()
 def get_student_timetable():
-    user_id = get_jwt_identity()
-    user = User.query.get(int(user_id))
-    if not user or user.role != "student":
+    uid = get_jwt_identity()
+    user = users_col().find_one({"_id": ObjectId(uid)})
+    if not user or user["role"] != "student":
         return jsonify({"error": "Unauthorized"}), 403
 
-    enrolled = user.enrolled_subjects.split(",") if user.enrolled_subjects else []
-    day = request.args.get("day")
-
-    # Build query based on stream and semester (no section)
-    query = TimetableEntry.query.filter(
-        TimetableEntry.stream == user.stream
-    )
-    
-    # Add semester filter if user has semester
-    if user.semester:
-        query = query.filter(
-            (TimetableEntry.semester == user.semester) | (TimetableEntry.semester == None)
-        )
-    
-    # Filter by enrolled subjects if any
+    enrolled = user.get("enrolled_subjects", [])
+    q = {"stream": user["stream"]}
+    if user.get("semester"):
+        q["$or"] = [{"semester": user["semester"]}, {"semester": None}]
     if enrolled:
-        query = query.filter(TimetableEntry.subject_code.in_(enrolled))
-    
-    if day:
-        query = query.filter_by(day=day)
+        q["subject_code"] = {"$in": enrolled}
+    if request.args.get("day"):
+        q["day"] = request.args["day"]
 
-    entries = query.order_by(TimetableEntry.day, TimetableEntry.start_time).all()
-    return jsonify({"entries": [e.to_dict() for e in entries]}), 200
+    entries = list(timetable_col().find(q).sort([("day", 1), ("start_time", 1)]))
+    return jsonify({"entries": [entry_to_dict(e) for e in entries]}), 200
 
 
 @timetable_bp.route("/faculty", methods=["GET"])
 @jwt_required()
 def get_faculty_timetable():
-    user_id = get_jwt_identity()
-    user = User.query.get(int(user_id))
-    if not user or user.role != "faculty":
+    uid = get_jwt_identity()
+    user = users_col().find_one({"_id": ObjectId(uid)})
+    if not user or user["role"] != "faculty":
         return jsonify({"error": "Unauthorized"}), 403
 
-    day = request.args.get("day")
-    query = TimetableEntry.query.filter_by(faculty_id=user.id)
-    if day:
-        query = query.filter_by(day=day)
-
-    entries = query.order_by(TimetableEntry.day, TimetableEntry.start_time).all()
-    return jsonify({"entries": [e.to_dict() for e in entries]}), 200
+    q = {"faculty_id": uid}
+    if request.args.get("day"):
+        q["day"] = request.args["day"]
+    entries = list(timetable_col().find(q).sort([("day", 1), ("start_time", 1)]))
+    return jsonify({"entries": [entry_to_dict(e) for e in entries]}), 200
 
 
 @timetable_bp.route("/subjects", methods=["GET"])
 @jwt_required()
 def get_subjects():
-    stream = request.args.get("stream")
-    query = Subject.query
-    if stream:
-        query = query.filter_by(stream=stream)
-    subjects = query.all()
-    return jsonify({"subjects": [s.to_dict() for s in subjects]}), 200
+    q = {}
+    if request.args.get("stream"):
+        q["stream"] = request.args["stream"]
+    subjects = list(subjects_col().find(q))
+    return jsonify({"subjects": [
+        {"id": str(s["_id"]), "name": s["name"], "code": s["code"],
+         "stream": s["stream"], "type": s["type"]}
+        for s in subjects
+    ]}), 200
 
 
 @timetable_bp.route("/rooms", methods=["GET"])
 @jwt_required()
 def get_rooms():
-    rooms = Room.query.all()
-    return jsonify({"rooms": [r.to_dict() for r in rooms]}), 200
+    rooms = list(rooms_col().find())
+    return jsonify({"rooms": [
+        {"id": str(r["_id"]), "name": r["name"], "capacity": r.get("capacity")}
+        for r in rooms
+    ]}), 200
 
 
 @timetable_bp.route("/notifications", methods=["GET"])
 @jwt_required()
 def get_notifications():
-    user_id = get_jwt_identity()
-    notifications = Notification.query.filter_by(
-        user_id=int(user_id)
-    ).order_by(Notification.created_at.desc()).limit(20).all()
-    return jsonify({"notifications": [n.to_dict() for n in notifications]}), 200
+    uid = get_jwt_identity()
+    notifs = list(notifications_col().find({"user_id": uid})
+                  .sort("created_at", -1).limit(20))
+    return jsonify({"notifications": [
+        {"id": str(n["_id"]), "user_id": n["user_id"], "message": n["message"],
+         "type": n["type"], "is_read": n.get("is_read", False),
+         "created_at": n["created_at"].isoformat()}
+        for n in notifs
+    ]}), 200
 
 
-@timetable_bp.route("/notifications/<int:notif_id>/read", methods=["PUT"])
+@timetable_bp.route("/notifications/<notif_id>/read", methods=["PUT"])
 @jwt_required()
 def mark_notification_read(notif_id):
-    user_id = get_jwt_identity()
-    notif = Notification.query.filter_by(id=notif_id, user_id=int(user_id)).first()
-    if not notif:
+    uid = get_jwt_identity()
+    result = notifications_col().update_one(
+        {"_id": ObjectId(notif_id), "user_id": uid},
+        {"$set": {"is_read": True}}
+    )
+    if result.matched_count == 0:
         return jsonify({"error": "Notification not found"}), 404
-    notif.is_read = True
-    db.session.commit()
     return jsonify({"message": "Marked as read"}), 200
